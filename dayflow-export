@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+"""
+dayflow-export: Export Dayflow activity data to markdown transcripts.
+
+Generates daily markdown files containing timeline cards, observations,
+and screenshot links for consumption by Claude or other LLMs.
+"""
+
+import argparse
+import json
+import re
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Export Dayflow activity data to markdown transcripts"
+    )
+    parser.add_argument(
+        "dayflow_path",
+        type=Path,
+        help="Path to Dayflow data directory (contains chunks.sqlite and recordings/)",
+    )
+    parser.add_argument(
+        "--from",
+        dest="from_date",
+        type=str,
+        help="Start date (YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--to",
+        dest="to_date",
+        type=str,
+        help="End date (YYYY-MM-DD)",
+    )
+    parser.add_argument(
+        "--date",
+        type=str,
+        help="Single date to export (YYYY-MM-DD)",
+    )
+    return parser.parse_args()
+
+
+def validate_dayflow_path(path: Path) -> tuple[Path, Path]:
+    """Validate the Dayflow directory and return paths to db and recordings."""
+    db_path = path / "chunks.sqlite"
+    recordings_path = path / "recordings"
+
+    if not path.exists():
+        raise ValueError(f"Dayflow directory not found: {path}")
+    if not db_path.exists():
+        raise ValueError(f"Database not found: {db_path}")
+    if not recordings_path.exists():
+        raise ValueError(f"Recordings directory not found: {recordings_path}")
+
+    return db_path, recordings_path
+
+
+def get_all_days(conn: sqlite3.Connection) -> list[str]:
+    """Get all days that have timeline cards."""
+    cur = conn.cursor()
+    cur.execute("SELECT DISTINCT day FROM timeline_cards WHERE is_deleted = 0 ORDER BY day")
+    return [row[0] for row in cur.fetchall()]
+
+
+def get_exported_days(transcripts_path: Path) -> set[str]:
+    """Get days that already have exported markdown files."""
+    if not transcripts_path.exists():
+        return set()
+    return {f.stem for f in transcripts_path.glob("*.md")}
+
+
+def parse_time_string(time_str: str) -> tuple[int, int]:
+    """Parse a time string like '9:13 AM' into (hour, minute) in 24h format."""
+    match = re.match(r"(\d+):(\d+)\s*(AM|PM)", time_str, re.IGNORECASE)
+    if not match:
+        return (0, 0)
+    hour, minute, period = int(match.group(1)), int(match.group(2)), match.group(3).upper()
+    if period == "PM" and hour != 12:
+        hour += 12
+    elif period == "AM" and hour == 12:
+        hour = 0
+    return (hour, minute)
+
+
+def calculate_tz_offset(card_start_ts: int, card_start_str: str) -> int:
+    """
+    Calculate timezone offset in seconds between stored timestamps and displayed times.
+
+    The database stores timestamps that when converted via datetime.fromtimestamp()
+    give a different time than what's displayed in the card's 'start' field.
+    This calculates the offset needed to correct observation timestamps.
+    """
+    # Get the hour/minute from the stored timestamp
+    dt = datetime.fromtimestamp(card_start_ts)
+    stored_hour, stored_minute = dt.hour, dt.minute
+
+    # Get the hour/minute from the displayed time string
+    display_hour, display_minute = parse_time_string(card_start_str)
+
+    # Calculate offset in seconds
+    stored_minutes = stored_hour * 60 + stored_minute
+    display_minutes = display_hour * 60 + display_minute
+
+    # Handle day boundary wraparound
+    diff_minutes = display_minutes - stored_minutes
+    if diff_minutes > 12 * 60:
+        diff_minutes -= 24 * 60
+    elif diff_minutes < -12 * 60:
+        diff_minutes += 24 * 60
+
+    return diff_minutes * 60
+
+
+def ts_to_time_with_offset(ts: int, offset_seconds: int) -> str:
+    """Convert Unix timestamp to human-readable time with timezone offset."""
+    dt = datetime.fromtimestamp(ts + offset_seconds)
+    hour = dt.hour
+    minute = dt.minute
+    period = "AM" if hour < 12 else "PM"
+    if hour == 0:
+        hour = 12
+    elif hour > 12:
+        hour -= 12
+    return f"{hour}:{minute:02d} {period}"
+
+
+def get_timeline_cards(conn: sqlite3.Connection, day: str) -> list[dict]:
+    """Get all timeline cards for a given day."""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT
+            id, batch_id, start, end, start_ts, end_ts,
+            title, summary, category, subcategory,
+            detailed_summary, metadata
+        FROM timeline_cards
+        WHERE day = ? AND is_deleted = 0
+        ORDER BY start_ts
+        """,
+        (day,),
+    )
+    columns = [
+        "id", "batch_id", "start", "end", "start_ts", "end_ts",
+        "title", "summary", "category", "subcategory",
+        "detailed_summary", "metadata"
+    ]
+    return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+def get_observations_for_card(
+    conn: sqlite3.Connection,
+    batch_id: int,
+    card_start_ts: int,
+    card_end_ts: int
+) -> list[dict]:
+    """Get observations for a given batch that fall within the card's time range."""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT start_ts, end_ts, observation
+        FROM observations
+        WHERE batch_id = ?
+          AND start_ts < ?
+          AND end_ts > ?
+        ORDER BY start_ts
+        """,
+        (batch_id, card_end_ts, card_start_ts),
+    )
+    return [
+        {"start_ts": row[0], "end_ts": row[1], "observation": row[2]}
+        for row in cur.fetchall()
+    ]
+
+
+def get_screenshots_for_card(
+    conn: sqlite3.Connection,
+    batch_id: int,
+    card_start_ts: int,
+    card_end_ts: int
+) -> list[dict]:
+    """Get screenshots for a given batch that fall within the card's time range."""
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT s.file_path, s.captured_at
+        FROM screenshots s
+        JOIN batch_screenshots bs ON bs.screenshot_id = s.id
+        WHERE bs.batch_id = ? AND s.is_deleted = 0
+          AND s.captured_at >= ? AND s.captured_at <= ?
+        ORDER BY s.captured_at
+        """,
+        (batch_id, card_start_ts, card_end_ts),
+    )
+    return [
+        {"file_path": row[0], "captured_at": row[1]}
+        for row in cur.fetchall()
+    ]
+
+
+def extract_filename(file_path: str) -> str:
+    """Extract just the filename from an absolute path."""
+    return Path(file_path).name
+
+
+def sample_screenshots(screenshots: list[dict], max_count: int = 5) -> list[dict]:
+    """Select evenly spaced sample of screenshots."""
+    if len(screenshots) <= max_count:
+        return screenshots
+
+    step = len(screenshots) / max_count
+    indices = [int(i * step) for i in range(max_count)]
+    return [screenshots[i] for i in indices]
+
+
+def get_screenshots_for_observation(
+    all_screenshots: list[dict],
+    start_ts: int,
+    end_ts: int,
+    max_count: int = 5
+) -> list[dict]:
+    """Get screenshots that fall within an observation's time range."""
+    matching = [
+        s for s in all_screenshots
+        if start_ts <= s["captured_at"] <= end_ts
+    ]
+    return sample_screenshots(matching, max_count)
+
+
+def parse_metadata(metadata_str: str | None) -> dict:
+    """Parse JSON metadata, returning empty dict on failure."""
+    if not metadata_str:
+        return {}
+    try:
+        return json.loads(metadata_str)
+    except json.JSONDecodeError:
+        return {}
+
+
+def format_distractions(distractions: list[dict]) -> str:
+    """Format distractions as markdown list."""
+    if not distractions:
+        return ""
+
+    lines = ["\n### Distractions\n"]
+    for d in distractions:
+        start = d.get("startTime", "?")
+        end = d.get("endTime", "?")
+        title = d.get("title", "Unknown")
+        lines.append(f"- **{start} - {end}:** {title}")
+    return "\n".join(lines)
+
+
+def format_app_sites(app_sites: dict) -> str:
+    """Format app/sites as a string."""
+    if not app_sites:
+        return "Unknown"
+
+    primary = app_sites.get("primary", "")
+    secondary = app_sites.get("secondary", "")
+
+    if primary and secondary:
+        return f"{primary}, {secondary}"
+    return primary or secondary or "Unknown"
+
+
+def generate_day_markdown(
+    conn: sqlite3.Connection,
+    day: str,
+    recordings_exist: set[str]
+) -> str:
+    """Generate markdown content for a single day."""
+    lines = [f"# Activity Log: {day}\n"]
+
+    cards = get_timeline_cards(conn, day)
+    if not cards:
+        lines.append("No activity recorded for this day.\n")
+        return "\n".join(lines)
+
+    for card in cards:
+        # Card header
+        lines.append(f"## {card['start']} - {card['end']}: {card['title']}\n")
+
+        # Category
+        category = card["category"] or "Unknown"
+        subcategory = card["subcategory"]
+        if subcategory:
+            lines.append(f"**Category:** {category} > {subcategory}")
+        else:
+            lines.append(f"**Category:** {category}")
+
+        # Apps/Sites
+        metadata = parse_metadata(card["metadata"])
+        app_sites = metadata.get("appSites", {})
+        lines.append(f"**Apps/Sites:** {format_app_sites(app_sites)}\n")
+
+        # Summary
+        lines.append("### Summary\n")
+        lines.append(card["detailed_summary"] or card["summary"] or "No summary available.")
+        lines.append("")
+
+        # Observations with screenshots
+        if card["batch_id"]:
+            observations = get_observations_for_card(
+                conn, card["batch_id"], card["start_ts"], card["end_ts"]
+            )
+            all_screenshots = get_screenshots_for_card(
+                conn, card["batch_id"], card["start_ts"], card["end_ts"]
+            )
+
+            # Calculate timezone offset from the card's known timestamp vs displayed time
+            tz_offset = calculate_tz_offset(card["start_ts"], card["start"])
+
+            if observations:
+                lines.append("### Detailed Activity\n")
+
+                for obs in observations:
+                    start_time = ts_to_time_with_offset(obs["start_ts"], tz_offset)
+                    end_time = ts_to_time_with_offset(obs["end_ts"], tz_offset)
+                    lines.append(f"**{start_time} - {end_time}:**")
+                    lines.append(obs["observation"])
+                    lines.append("")
+
+                    # Add screenshots for this observation
+                    obs_screenshots = get_screenshots_for_observation(
+                        all_screenshots, obs["start_ts"], obs["end_ts"]
+                    )
+                    for s in obs_screenshots:
+                        filename = extract_filename(s["file_path"])
+                        if filename in recordings_exist:
+                            lines.append(f"![](../recordings/{filename})")
+
+                    if obs_screenshots:
+                        lines.append("")
+
+        # Distractions
+        distractions = metadata.get("distractions", [])
+        if distractions:
+            lines.append(format_distractions(distractions))
+            lines.append("")
+
+        lines.append("---\n")
+
+    return "\n".join(lines)
+
+
+def get_existing_recordings(recordings_path: Path) -> set[str]:
+    """Get set of existing recording filenames."""
+    return {f.name for f in recordings_path.glob("*.jpg")}
+
+
+def export_day(
+    conn: sqlite3.Connection,
+    day: str,
+    transcripts_path: Path,
+    recordings_exist: set[str]
+) -> None:
+    """Export a single day to markdown."""
+    content = generate_day_markdown(conn, day, recordings_exist)
+    output_file = transcripts_path / f"{day}.md"
+    output_file.write_text(content)
+    print(f"Exported: {output_file}")
+
+
+def main():
+    args = parse_args()
+
+    # Validate paths
+    db_path, recordings_path = validate_dayflow_path(args.dayflow_path)
+    transcripts_path = args.dayflow_path / "transcripts"
+
+    # Connect to database
+    conn = sqlite3.connect(db_path)
+
+    # Get all available days
+    all_days = get_all_days(conn)
+    if not all_days:
+        print("No timeline cards found in database.")
+        return
+
+    # Determine which days to export
+    if args.date:
+        days_to_export = [args.date] if args.date in all_days else []
+        if not days_to_export:
+            print(f"No data found for date: {args.date}")
+            return
+    elif args.from_date or args.to_date:
+        from_date = args.from_date or all_days[0]
+        to_date = args.to_date or all_days[-1]
+        days_to_export = [d for d in all_days if from_date <= d <= to_date]
+        if not days_to_export:
+            print(f"No data found for range: {from_date} to {to_date}")
+            return
+    else:
+        # Default: export days not yet exported
+        exported = get_exported_days(transcripts_path)
+        days_to_export = [d for d in all_days if d not in exported]
+        if not days_to_export:
+            print("All days already exported. Use --from/--to to re-export.")
+            return
+
+    # Create transcripts directory
+    transcripts_path.mkdir(exist_ok=True)
+
+    # Get existing recordings for validation
+    recordings_exist = get_existing_recordings(recordings_path)
+
+    # Export each day
+    print(f"Exporting {len(days_to_export)} day(s)...")
+    for day in days_to_export:
+        export_day(conn, day, transcripts_path, recordings_exist)
+
+    conn.close()
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()
