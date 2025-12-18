@@ -24,6 +24,17 @@ def parse_args():
         help="Path to Dayflow data directory (contains chunks.sqlite and recordings/)",
     )
     parser.add_argument(
+        "--output",
+        "-o",
+        type=Path,
+        help="Output directory for transcripts (default: dayflow_path/transcripts)",
+    )
+    parser.add_argument(
+        "--recordings-path",
+        type=str,
+        help="Path prefix for screenshot links (default: ../recordings)",
+    )
+    parser.add_argument(
         "--from",
         dest="from_date",
         type=str,
@@ -269,7 +280,8 @@ def format_app_sites(app_sites: dict) -> str:
 def generate_day_markdown(
     conn: sqlite3.Connection,
     day: str,
-    recordings_exist: set[str]
+    recordings_exist: set[str],
+    recordings_path: str = "../recordings"
 ) -> str:
     """Generate markdown content for a single day."""
     lines = [f"# Activity Log: {day}\n"]
@@ -330,7 +342,7 @@ def generate_day_markdown(
                     for s in obs_screenshots:
                         filename = extract_filename(s["file_path"])
                         if filename in recordings_exist:
-                            lines.append(f"![](../recordings/{filename})")
+                            lines.append(f"![]({recordings_path}/{filename})")
 
                     if obs_screenshots:
                         lines.append("")
@@ -355,10 +367,11 @@ def export_day(
     conn: sqlite3.Connection,
     day: str,
     transcripts_path: Path,
-    recordings_exist: set[str]
+    recordings_exist: set[str],
+    recordings_path: str = "../recordings"
 ) -> None:
     """Export a single day to markdown."""
-    content = generate_day_markdown(conn, day, recordings_exist)
+    content = generate_day_markdown(conn, day, recordings_exist, recordings_path)
     output_file = transcripts_path / f"{day}.md"
     output_file.write_text(content)
     print(f"Exported: {output_file}")
@@ -368,8 +381,9 @@ def main():
     args = parse_args()
 
     # Validate paths
-    db_path, recordings_path = validate_dayflow_path(args.dayflow_path)
-    transcripts_path = args.dayflow_path / "transcripts"
+    db_path, recordings_dir = validate_dayflow_path(args.dayflow_path)
+    transcripts_path = args.output if args.output else args.dayflow_path / "transcripts"
+    recordings_path = args.recordings_path if args.recordings_path else "../recordings"
 
     # Connect to database
     conn = sqlite3.connect(db_path)
@@ -405,12 +419,12 @@ def main():
     transcripts_path.mkdir(exist_ok=True)
 
     # Get existing recordings for validation
-    recordings_exist = get_existing_recordings(recordings_path)
+    recordings_exist = get_existing_recordings(recordings_dir)
 
     # Export each day
     print(f"Exporting {len(days_to_export)} day(s)...")
     for day in days_to_export:
-        export_day(conn, day, transcripts_path, recordings_exist)
+        export_day(conn, day, transcripts_path, recordings_exist, recordings_path)
 
     conn.close()
     print("Done.")
