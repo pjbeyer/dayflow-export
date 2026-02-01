@@ -1,6 +1,6 @@
 # dayflow-export
 
-Export [Dayflow](https://dayflow.com) activity data to markdown transcripts for consumption by Claude or other LLMs.
+Export [Dayflow](https://github.com/JerryZLiu/Dayflow) activity data to markdown transcripts for consumption by Claude or other LLMs.
 
 ## What it does
 
