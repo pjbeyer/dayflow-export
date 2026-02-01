@@ -12,6 +12,7 @@ import re
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 
 def parse_args():
@@ -240,7 +241,7 @@ def get_screenshots_for_observation(
     return sample_screenshots(matching, max_count)
 
 
-def parse_metadata(metadata_str: str | None) -> dict:
+def parse_metadata(metadata_str: Optional[str]) -> dict:
     """Parse JSON metadata, returning empty dict on failure."""
     if not metadata_str:
         return {}
